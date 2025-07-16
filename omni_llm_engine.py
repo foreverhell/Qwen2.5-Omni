@@ -56,7 +56,8 @@ from vllm.transformers_utils.config import (get_config,
 from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import LRUCache, get_open_zmq_ipc_path
-
+from vllm.inputs import TextPrompt, TokensPrompt
+from fastapi import Request
 POLLING_TIMEOUT_MS = 10000
 HEALTHY_RESPONSE = (pickle.dumps(VLLM_RPC_SUCCESS_STR), )
 
@@ -1233,7 +1234,6 @@ class OmniLLMEngine:
         code2wav_dynamic_batch: Optional[bool] = False,
         code2wav_steps: int = 10,
     ):
-        self.is_special = {}
         self.thinker_engine_args = thinker_engine_args
         if talker_engine_args is None:
             talker_engine_args = {}
@@ -1269,7 +1269,22 @@ class OmniLLMEngine:
         if (self.code2wav_visible_devices
                 and not isinstance(self.code2wav_visible_devices, list)):
             self.code2wav_visible_devices = [self.code2wav_visible_devices]
+        #默认采样参数，请求没传就使用这个
+        self.sampling_params = SamplingParams(
+            temperature=0.0,
+            top_k=-1,
+            top_p=1.0,
+            repetition_penalty=1.1,
+            max_tokens=2048,
+            detokenize=True,
+            seed=0,
+        )
 
+        self.last_prompt = {} #上一次 thinker 生成的文本和文本token，request_id会冲突，不要和request_id绑定，和prompt绑定
+        self.last_talker_token = {} #上一次 talker 生成的语音token，request_id会冲突，不要和request_id绑定，和prompt绑定
+        #self.request = {} #需要和request_id绑定。不传递就可以不要
+        self.is_first = False
+        self.is_special = {}
         # Enable hidden state caching for the thinker engine.
         self.thinker_engine_args.enable_hidden_state_caching = True
 
@@ -1283,11 +1298,13 @@ class OmniLLMEngine:
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-
+        
         self._async_loop_thread = Thread(target=self._start_async_loop,
                                          daemon=True)
         self._async_loop_thread.start()
 
+        #thinker_stream = torch.cuda.Stream(priority=0)  # 较低优先级
+        #talker_stream = torch.cuda.Stream(priority=-1)  # 较高优先级
         # thinker: async engine
         self.thinker_engine = self._start_thinker_engine(
             thinker_engine_args, self.thinker_visible_devices)
@@ -1366,7 +1383,9 @@ class OmniLLMEngine:
                 engine_client,
                 thread,
             ) = self._start_talker_engine(talker_type, engine_args,
-                                          visible_devices)
+                                        visible_devices)
+            #thinker_stream.synchronize()
+            #talker_stream.synchronize()
             self._talker_pids.append(pid)
             self._talker_processes.append(process)
             self._talker_engine_clients[talker_type] = engine_client
@@ -1444,7 +1463,19 @@ class OmniLLMEngine:
         self.code2wav_bs_mel = 24 if code2wav_frequency == "50hz" else 32
         self.code2wav_future_cache_size = self.code2wav_bs_mel * 1
         self.code2wav_chunk_size = self.code2wav_bs_mel * self.code2wav_batched_chunk
-
+        self.factor = 2 if code2wav_frequency == "50hz" else 4
+        self.talker_sampling_params = SamplingParams(
+            temperature=0.9,
+            top_k=40,
+            top_p=0.8,
+            repetition_penalty=1.05,
+            max_tokens=2048,
+            detokenize=False,
+            seed=0,
+            chunked_return = True,
+            chunked_return_first_size = self.code2wav_future_cache_size // self.factor,
+            chunked_return_size = self.code2wav_chunk_size // self.factor
+        )
         # code2wav result listener
         self._code2wav_listener_thread = []
         for i in range(self.code2wav_data_parallelism):
@@ -1806,7 +1837,10 @@ class OmniLLMEngine:
             last_output = None
             start = time.time()
             for output in SynchronizedGenerator(generator, self._loop):
-                print("thinker token",time.time()-start)
+                print("thinker token",time.time()-start,len(output.outputs[0].token_ids))
+                #self.last_prompt[request_id]["prompt"] = output.prompt + output.outputs[0].text #更新prompt文本，复用multi_modal_data
+                #self.last_prompt[request_id]["generated_token_ids"] = output.outputs[0].token_ids #新生成的文本token。没必要在这里extend，每次都要先赋值再extend
+                #print(self.last_prompt[request_id])
                 if include_voice and self.talker_engine_args:
                     if output.finished:
                         thinker_output = copy.deepcopy(output)
@@ -1814,8 +1848,10 @@ class OmniLLMEngine:
                             thinker_output.finished = False
                     else:
                         thinker_output = output
+
                     thinker_outputs.put(
                         (request_id, voice_type, thinker_output))
+
                 last_output = output
                 with suppress_output_queue_exception():
                     self.output_queue[request_id].put(output)
@@ -1823,6 +1859,8 @@ class OmniLLMEngine:
                 with suppress_output_queue_exception():
                     self.output_queue[request_id].put(None)
                     self.output_queue.pop(request_id)
+            
+            #if last_output:#这个是我加的
             logger.info(
                 "Thinker request %s finished, reason: (%r, %r), outputs: %r, output tokens: %r",
                 request_id, last_output.outputs[0].finish_reason,
@@ -1839,25 +1877,26 @@ class OmniLLMEngine:
                 for i, token_embed in enumerate(special_token_embeds):
                     thinker_outputs.put(
                         (request_id, voice_type,
-                         RequestOutput(
-                             request_id=request_id,
-                             prompt=last_output.prompt,
-                             prompt_token_ids=last_output.prompt_token_ids,
-                             prompt_logprobs=last_output.prompt_logprobs,
-                             outputs=[
-                                 CompletionOutput(
-                                     index=0,
-                                     text='',
-                                     token_ids=[],
-                                     cumulative_logprob=None,
-                                     logprobs=None,
-                                     prompt_embeds=token_embed,
-                                 )
-                             ],
-                             finished=i == len(special_token_embeds) - 1,
-                         )))
+                        RequestOutput(
+                            request_id=request_id,
+                            prompt=last_output.prompt,
+                            prompt_token_ids=last_output.prompt_token_ids,
+                            prompt_logprobs=last_output.prompt_logprobs,
+                            outputs=[
+                                CompletionOutput(
+                                    index=0,
+                                    text='',
+                                    token_ids=[],
+                                    cumulative_logprob=None,
+                                    logprobs=None,
+                                    prompt_embeds=token_embed,
+                                )
+                            ],
+                            finished=i == len(special_token_embeds) - 1,
+                        )))
 
             with contextlib.suppress(Exception):
+                #print("thinker is over")
                 del self.thinker_listener[request_id]
 
         self.thinker_listener[request_id] = Thread(target=_listen, daemon=True)
@@ -1881,6 +1920,111 @@ class OmniLLMEngine:
         def _listen():
             last_output, finished = None, False
             start = time.time()
+            last_num = 0
+            for output in SynchronizedGenerator(generator, self._loop):
+                print("talker token",time.time()-start,len(output.outputs[0].token_ids))
+                '''
+                if self.last_talker_token.get(request_id):
+                    tmp = list(self.last_talker_token[request_id])
+                    tmp.extend(output.outputs[0].token_ids[last_num:])
+                    output.outputs[0].token_ids = tmp
+                last_num = len(output.outputs[0].token_ids)
+                
+                self.last_talker_token[request_id] = output.outputs[0].token_ids #只加入新生成的试试
+                '''
+                '''
+                if self.last_talker_token.get(request_id):
+                    self.last_talker_token[request_id] = list(self.last_talker_token[request_id])
+                    self.last_talker_token[request_id].extend(output.outputs[0].token_ids[last_num:])
+                    output.outputs[0].token_ids = self.last_talker_token[request_id]
+                    last_num = len(output.outputs[0].token_ids)
+                '''
+                if self.is_first and len(output.outputs[0].token_ids) == 1:#第一次请求，强行停掉请求
+                    #thinker暂停，或者直接abort掉整个请求
+                    print("第一次中断请求")
+                    #self.thinker_engine._request_tracker._request_streams[request_id].pause = True #传不进去
+                    self.abort_request(request_id)    
+                if not self._code2wav_engine_clients or not include_code2wav:
+                    output_queue.put(output)
+                elif last_output is None:
+                    if output.finished:
+                        self._talker_to_code2wav(output.request_id, voice_type,
+                                                 [], True)
+                else:
+                    last_code = list(last_output.outputs[0].token_ids)
+                    if output.finished:
+                        curr_code = list(output.outputs[0].token_ids)
+                        if curr_code[-1] in [
+                                talker_hf_config.tts_codec_end_token_id,
+                                talker_hf_config.tts_codec_start_token_id
+                        ]:
+                            self._talker_to_code2wav(output.request_id,
+                                                     voice_type, last_code,
+                                                     False)
+                            self._talker_to_code2wav(output.request_id,
+                                                     voice_type,
+                                                     curr_code[:-1], True)
+                        else:
+                            self._talker_to_code2wav(output.request_id,
+                                                     voice_type, last_code,
+                                                     False)
+                            self._talker_to_code2wav(output.request_id,
+                                                     voice_type, curr_code,
+                                                     True)
+                    else:
+                        self._talker_to_code2wav(output.request_id, voice_type,
+                                                 last_code, False)
+                last_output = output
+
+
+                if not finished and not output.finished:
+                    prompt_embeds, finished = talker_input_queue.get()
+                    if prompt_embeds is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            talker_client.resume_request(
+                                request_id, prompt_embeds, finished),
+                            self._loop,
+                        ).result()
+            if not self._code2wav_engine_clients or not include_code2wav:
+                output_queue.put(None)
+
+            logger.info(
+                "Talker request %s finished, reason: (%r, %r), output tokens: %r",
+                request_id, last_output.outputs[0].finish_reason,
+                last_output.outputs[0].stop_reason,
+                last_output.outputs[0].token_ids)
+
+            with contextlib.suppress(Exception):
+                del self.talker_listener[request_id]
+                del self.talker_inputs[request_id]
+
+        self.talker_listener[request_id] = Thread(target=_listen, daemon=True)
+        self.talker_listener[request_id].start()
+
+    def _listen_talker_revised(
+        self,
+        talker_client: MQLLMEngineClient,
+        request_id: str,
+        voice_type: str,
+        generator: AsyncGenerator[RequestOutput, None],
+        output_queue: queue.Queue[Union[RequestOutput, np.ndarray]],
+        talker_input_queue: queue.Queue[Optional[Tuple[torch.Tensor, bool]]],
+    ):
+        # 配置参数
+        AUDIO_CHUNK_SIZE = 12  # 每生成12个语音token检查一次新的thinker数据
+        MAX_WAIT_TIME = 0.5    # 最长等待时间500ms# 每20个语音token检查一次新的thinker数据
+        include_code2wav = not self._ignore_code2wav(voice_type)
+
+        talker_hf_config = self.talker_config
+        if hasattr(talker_hf_config, 'talker_config'):
+            talker_hf_config = talker_hf_config.talker_config
+
+        def _listen():
+            last_output, finished = None, False
+            last_audio_token_count = 0
+            audio_token_count = 0
+            start = time.time()
+            last_thinker_update = time.time()
             for output in SynchronizedGenerator(generator, self._loop):
                 print("talker token",time.time()-start,len(output.outputs[0].token_ids))
                 if not self._code2wav_engine_clients or not include_code2wav:
@@ -1915,15 +2059,39 @@ class OmniLLMEngine:
                                                  last_code, False)
                 last_output = output
 
-                if not finished and not output.finished:
-                    prompt_embeds, finished = talker_input_queue.get()
-                    if prompt_embeds is not None:
+                audio_token_count = len(output.outputs[0].token_ids)             
+                current_time = time.time()
+
+                # 满足以下条件之一时，检查新的thinker数据：
+                # 1. 生成了足够多的音频token
+                # 2. 距离上次更新超过一定时间
+                # 3. talker生成完成
+
+                should_check = (
+                    audio_token_count - last_audio_token_count >= AUDIO_CHUNK_SIZE or
+                    current_time - last_thinker_update > MAX_WAIT_TIME  or  # 500ms
+                    output.finished
+                )
+                last_audio_token_count = audio_token_count
+                print("should_check",should_check,audio_token_count)
+                #f should_check and not output.finished:
+                new_thinker_data = self._collect_available_thinker_data(talker_input_queue)
+                print("new_thinker_data",new_thinker_data,len(new_thinker_data))
+                
+                # 如果有新数据,逐个应用到talker
+                if new_thinker_data:
+                    for prompt_embeds, finished in new_thinker_data:
                         asyncio.run_coroutine_threadsafe(
                             talker_client.resume_request(
-                                request_id, prompt_embeds, finished),
+                                request_id, prompt_embeds, finished),#finished强制改为True，就不等了，但是一直在生成前几个音频
                             self._loop,
-                        ).result()
-
+                        )
+                    audio_token_count = 0
+                    last_thinker_update = current_time
+                
+                # 如果talker完成,退出循环。就是因为跳出了循环，导致事件终止
+                #if output.finished:
+                #    break
             if not self._code2wav_engine_clients or not include_code2wav:
                 output_queue.put(None)
 
@@ -1939,7 +2107,20 @@ class OmniLLMEngine:
 
         self.talker_listener[request_id] = Thread(target=_listen, daemon=True)
         self.talker_listener[request_id].start()
-
+        
+    def _collect_available_thinker_data(self, talker_input_queue: queue.Queue):
+        """非阻塞收集所有可用的thinker数据"""
+        data = []
+        while True:#not talker_input_queue.empty()
+            try:
+                prompt_embeds, finished = talker_input_queue.get_nowait()
+                data.append((prompt_embeds, finished))
+                if finished:
+                    break
+            except queue.Empty:
+                break
+        return data
+            
     def _listen_code2wav(self, code2wav_engine_client_id):
         while True:
             try:
@@ -1985,8 +2166,8 @@ class OmniLLMEngine:
         #   tokens: [input_tokens] + [codec_pad_token] + [codec_bos_token]
         #   embeddings: [input_embeds] + [text_bos_token] + [thinker_reply_part[0]]
         #   thinker_reply_part: [thinker_reply_part[1:]] + [text_eos_token] + [text_pad_token]
-
-        if output == None:
+        #再设置一个暂停标识，不要把talker停掉
+        if output == None:#因为finish正常停止thinker时，停止talker；非正常停止talker时，先不要停掉talker
             asyncio.run_coroutine_threadsafe(
                 talker_client.abort(request_id),
                 self._loop,
@@ -1995,14 +2176,13 @@ class OmniLLMEngine:
                 self.output_queue[request_id].put(None)
                 self.output_queue.pop(request_id)
             return
-
         if len(output.outputs[0].token_ids) == 1 and output.finished:
             # don't involve talker model.
             with suppress_output_queue_exception():
                 self.output_queue[request_id].put(None)
                 self.output_queue.pop(request_id)
             return
-        
+        #生成的token是训练的special token，不生成音频
         if len(output.outputs[0].token_ids) and output.outputs[0].token_ids[-1] == 151665:#必须要保证存在，再索引
             self.is_special[request_id] = True
         if self.is_special[request_id] and output.finished:
@@ -2013,14 +2193,14 @@ class OmniLLMEngine:
             #    self.output_queue.pop(request_id)
             self.abort_request(request_id)
             return
-        
-        output_prompt_embeds = output.outputs[0].prompt_embeds.to(self.device)
 
+        #start = time.time()
+        output_prompt_embeds = output.outputs[0].prompt_embeds.to(self.device)
+        #print("传递参数花的时间", time.time()-start)#慢的时候1ms，快的时候1e-5
         if len(output.outputs[0].token_ids) == 1:
             self.thinker_prompt_embeds[
                 output.request_id] = output_prompt_embeds
             return
-
         talker_hf_config = self.talker_config
         if hasattr(talker_hf_config, 'talker_config'):
             talker_hf_config = talker_hf_config.talker_config
@@ -2028,7 +2208,7 @@ class OmniLLMEngine:
         if len(output.outputs[0].token_ids) == 2:
             # issue request
             prompt_embeds = torch.cat([
-                self.thinker_prompt_embeds.pop(output.request_id),
+                self.thinker_prompt_embeds.pop(output.request_id),#
                 self._get_embed_text_spk_token(voice_type) +
                 self.embed_codec_pad_token,
                 output_prompt_embeds + self.embed_codec_bos_token,
@@ -2077,7 +2257,7 @@ class OmniLLMEngine:
                 self.output_queue[output.request_id],
                 self.talker_inputs[output.request_id],
             )
-        elif output.request_id in self.talker_inputs:
+        elif output.request_id in self.talker_inputs:#output包含所有token的信息，embed不知道，不每次都写进队列
             self.talker_inputs[output.request_id].put(
                 (output_prompt_embeds, output.finished))
         else:
@@ -2094,11 +2274,11 @@ class OmniLLMEngine:
         if finished:
             logger.info("Talker request %s finished with %d tokens",
                         request_id, len(code))
-        chunk_code_length = len(code) * (2 if self.code2wav_frequency == "50hz"
-                                         else
-                                         4) - self.code2wav_future_cache_size
+        chunk_code_length = len(code) * self.factor - self.code2wav_future_cache_size
+        #print(len(code),chunk_code_length,self.code2wav_chunk_size)
+        #start = time.time()
         if (chunk_code_length > 0 and
-                chunk_code_length % self.code2wav_chunk_size == 0) or finished:
+                chunk_code_length % (self.code2wav_chunk_size) == 0) or finished:
 
             code2wav_engine_id = 0
             if self.code2wav_data_parallelism > 0:
@@ -2128,12 +2308,31 @@ class OmniLLMEngine:
         inputs: Optional[PromptType] = None,  # DEPRECATED
         talker_type: str = "default",
         voice_type: str = "default",
+        is_first = False,
     ) -> queue.Queue[Union[RequestOutput, np.ndarray]]:
         self.is_special[request_id] = False
+        '''
+        #self.request[request_id] = request #需要和request_id绑定
+        before_prompt = prompt
+        talker_token = []
+        if self.last_prompt.get(request_id):
+           prompt = self.last_prompt[request_id]
+           talker_token = self.last_talker_token[request_id]
+           request_id = request_id[:-1]+chr(ord(request_id[-1]) + 1) #通过ascii码值对request_id+1
+        if prompt.get("generated_token_ids"):
+           generated_token_ids = prompt.pop('generated_token_ids')
+           prompt["prompt_token_ids"].extend(generated_token_ids)#不使用它相当于没有使用上一次的推理结果？prompt没有用，但是推理的中间值复用了     
+        self.last_prompt[request_id] = prompt #需要和request_id绑定
+        self.last_talker_token[request_id] = talker_token
+        self.is_first = is_first
+        '''
         # normalize voice_type
         if voice_type:
             voice_type = voice_type.lower()
-
+            
+        if voice_type == "default":
+            voice_type = self.default_tts_text_spk_type
+            
         if (self.talker_engine_args and voice_type
                 and (not self._ignore_voice(voice_type))
                 and self.code2wav_voice_types
@@ -2141,9 +2340,6 @@ class OmniLLMEngine:
             raise ValueError(
                 f"Voice type '{voice_type}' not found in available voice types: {self.code2wav_voice_types}"
             )
-
-        if voice_type == "default":
-            voice_type = self.default_tts_text_spk_type
 
         if not params:
             params = SamplingParams(
@@ -2154,7 +2350,6 @@ class OmniLLMEngine:
                 repetition_penalty,
                 stop_token_ids=self.thinker_config.eos_token_id,
             )
-
         generator = asyncio.run_coroutine_threadsafe(
             self.thinker_engine.add_request(
                 request_id=request_id,
@@ -2168,6 +2363,7 @@ class OmniLLMEngine:
             ),
             self._loop,
         ).result()
+        
         self._listen_thinker(request_id, voice_type, generator,
                              self.thinker_outputs[talker_type])
 
@@ -2194,18 +2390,15 @@ class OmniLLMEngine:
 
             # talker: chunked output to reduce overhead of zmq
             talker_params.chunked_return = True
-            talker_params.chunked_return_first_size = self.code2wav_future_cache_size // (
-                2 if self.code2wav_frequency == "50hz" else 4)
-            talker_params.chunked_return_size = self.code2wav_chunk_size // (
-                2 if self.code2wav_frequency == "50hz" else 4)
+            talker_params.chunked_return_first_size = self.code2wav_future_cache_size // self.factor
+            talker_params.chunked_return_size = self.code2wav_chunk_size // self.factor
 
             if params and params.max_tokens:
                 factor = 1 if self._ignore_code2wav(voice_type) else 40
                 talker_params.max_tokens = min(talker_params.max_tokens,
                                                params.max_tokens * factor)
 
-            self.talker_requests[request_id] = (prompt, talker_params)
-
+            self.talker_requests[request_id] = (prompt, talker_params)#before_prompt
         return self.output_queue[request_id]
 
     def abort_request(self, request_id: str, talker_type: str = "default"):
@@ -2222,3 +2415,528 @@ class OmniLLMEngine:
 
     def _ignore_code2wav(self, voice_type: str = "default") -> bool:
         return voice_type and voice_type.lower() in ["prefix_caching"]
+    
+    
+from dataclasses import dataclass
+from enum import IntEnum
+class AudioGenerationPhase(IntEnum):
+    """音频生成阶段枚举"""
+    ULTRA_LOW_LATENCY = 0  # 0-2秒，极低延迟
+    BALANCED = 1           # 2-5秒，平衡模式  
+    HIGH_QUALITY = 2       # 5秒后，高质量模式
+
+@dataclass
+class AudioGenerationState:
+    """音频生成状态管理"""
+    current_phase: AudioGenerationPhase = AudioGenerationPhase.ULTRA_LOW_LATENCY
+    audio_duration_generated: float = 0.0  # 已生成音频时长（秒）
+    text_tokens_processed: int = 0
+    audio_buffer_level: float = 0.0  # 当前音频buffer中的时长
+    user_playback_position: float = 0.0  # 用户播放进度
+    playback_start_time: Optional[float] = None
+    last_phase_switch_time: float = 0.0
+    emergency_mode: bool = False
+
+    def update_from_output(self, output):
+        """从输出更新状态"""
+        if hasattr(output, 'outputs') and output.outputs:
+            audio_tokens = len(output.outputs[0].token_ids)
+            # 1秒 = 50个音频token
+            self.audio_duration_generated = audio_tokens / 50.0
+
+    def should_switch_phase(self) -> bool:
+        """判断是否应该切换阶段"""
+        current_time = time.time()
+
+        if self.current_phase == AudioGenerationPhase.ULTRA_LOW_LATENCY:
+            # 生成了2秒音频或经过了3秒时间后切换
+            return (self.audio_duration_generated >= 2.0 or 
+                    current_time - self.last_phase_switch_time >= 3.0)
+        elif self.current_phase == AudioGenerationPhase.BALANCED:
+            # 生成了5秒音频或经过了8秒时间后切换
+            return (self.audio_duration_generated >= 5.0 or 
+                    current_time - self.last_phase_switch_time >= 8.0)
+        return False
+
+    def switch_to_next_phase(self):
+        """切换到下一阶段"""
+        if self.current_phase == AudioGenerationPhase.ULTRA_LOW_LATENCY:
+            self.current_phase = AudioGenerationPhase.BALANCED
+        elif self.current_phase == AudioGenerationPhase.BALANCED:
+            self.current_phase = AudioGenerationPhase.HIGH_QUALITY
+
+        self.last_phase_switch_time = time.time()
+        logger.info(f"Switched to phase: {self.current_phase.name}")
+
+class PhaseConfigManager:
+    """阶段配置管理器"""
+
+    def __init__(self):
+        self.configs = {
+            AudioGenerationPhase.ULTRA_LOW_LATENCY: {
+                'text_token_batch_size': 1,
+                'audio_token_target_per_text': 8,
+                'quality_params': {
+                    'temperature': 1.2,
+                    'top_p': 0.9,
+                    'repetition_penalty': 1.0,
+                },
+                'timeout_ms': 100,
+                'max_wait_time': 0.05,  # 50ms最大等待时间
+            },
+
+            AudioGenerationPhase.BALANCED: {
+                'text_token_batch_size': 2,
+                'audio_token_target_per_text': 15,
+                'quality_params': {
+                    'temperature': 1.0,
+                    'top_p': 0.95,
+                    'repetition_penalty': 1.05,
+                },
+                'timeout_ms': 200,
+                'max_wait_time': 0.15,  # 150ms最大等待时间
+            },
+
+            AudioGenerationPhase.HIGH_QUALITY: {
+                'text_token_batch_size': 3,
+                'audio_token_target_per_text': 25,
+                'quality_params': {
+                    'temperature': 0.8,
+                    'top_p': 0.98,
+                    'repetition_penalty': 1.1,
+                },
+                'timeout_ms': 500,
+                'max_wait_time': 0.3,   # 300ms最大等待时间
+            }
+        }
+
+    def get_config(self, phase: AudioGenerationPhase) -> Dict[str, Any]:
+        """获取指定阶段的配置"""
+        return self.configs[phase]
+
+    def get_batch_size(self, phase: AudioGenerationPhase) -> int:
+        """获取批量大小"""
+        return self.configs[phase]['text_token_batch_size']
+
+    def get_target_tokens(self, phase: AudioGenerationPhase) -> int:
+        """获取目标音频token数量"""
+        return self.configs[phase]['audio_token_target_per_text']
+
+    def get_timeout(self, phase: AudioGenerationPhase) -> float:
+        """获取超时时间（秒）"""
+        return self.configs[phase]['timeout_ms'] / 1000.0
+
+class BufferMonitor:
+    """音频buffer监控器"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """重置监控状态"""
+        self.start_time = time.time()
+        self.last_audio_duration = 0.0
+
+    def update(self, audio_duration: float, user_playback_position: float) -> str:
+        """
+        更新buffer状态并返回当前模式
+        返回: "EMERGENCY", "NORMAL", "RELAXED"
+        """
+        buffer_remaining = audio_duration - user_playback_position
+
+        if buffer_remaining < 0.5:  # buffer不足0.5秒
+            return "EMERGENCY"
+        elif buffer_remaining > 2.0:  # buffer超过2秒
+            return "RELAXED"
+        else:
+            return "NORMAL"
+
+    def estimate_user_playback_position(self) -> float:
+        """估算用户播放进度（假设实时播放）"""
+        return time.time() - self.start_time
+
+class OptimizedOmniLLMEngine(OmniLLMEngine):
+    """优化的OmniLLMEngine，支持自适应质量控制"""
+
+    def _listen_talker_adaptive_quality(
+        self,
+        talker_client,
+        request_id: str,
+        voice_type: str,
+        generator,
+        output_queue,
+        talker_input_queue,
+    ):
+        """
+        自适应质量的talker监听器
+        根据生成阶段动态调整质量和延迟策略
+        """
+
+        include_code2wav = not self._ignore_code2wav(voice_type)
+
+        # 初始化状态管理器
+        state = AudioGenerationState()
+        config_manager = PhaseConfigManager()
+        buffer_monitor = BufferMonitor()
+
+        def _listen():
+            last_output = None
+            finished = False
+            audio_token_count = 0
+            last_text_check_time = time.time()
+            text_token_buffer = []
+
+            try:
+                logger.info(f"Starting adaptive quality generation for request {request_id}")
+                start = time.time()
+                for output in SynchronizedGenerator(generator, self._loop):
+                    print("talker token",time.time()-start,len(output.outputs[0].token_ids))
+                    current_time = time.time()
+
+                    # 1. 处理code2wav输出
+                    if not self._code2wav_engine_clients or not include_code2wav:
+                        output_queue.put(output)
+                    else:
+                        self._handle_code2wav_output(output, last_output, voice_type)
+
+                    last_output = output
+
+                    # 2. 更新状态
+                    state.update_from_output(output)
+                    audio_token_count += 1
+
+                    # 3. 检查是否需要切换阶段
+                    if state.should_switch_phase():
+                        state.switch_to_next_phase()
+                        logger.info(f"Switched to {state.current_phase.name} phase for request {request_id}")
+
+                    # 4. 更新buffer监控
+                    user_pos = buffer_monitor.estimate_user_playback_position()
+                    buffer_status = buffer_monitor.update(state.audio_duration_generated, user_pos)
+
+                    # 5. 根据当前阶段和buffer状态处理
+                    if state.current_phase == AudioGenerationPhase.ULTRA_LOW_LATENCY:
+                        finished = self._handle_ultra_low_latency_phase(
+                            output, state, config_manager, talker_client, 
+                            request_id, talker_input_queue, current_time, 
+                            last_text_check_time, buffer_status
+                        )
+                    elif state.current_phase == AudioGenerationPhase.BALANCED:
+                        finished = self._handle_balanced_phase(
+                            output, state, config_manager, talker_client,
+                            request_id, talker_input_queue, current_time,
+                            last_text_check_time, buffer_status, text_token_buffer
+                        )
+                    else:  # HIGH_QUALITY
+                        finished = self._handle_high_quality_phase(
+                            output, state, config_manager, talker_client,
+                            request_id, talker_input_queue, current_time,
+                            last_text_check_time, buffer_status, text_token_buffer
+                        )
+
+                    # 6. 检查是否完成
+                    if output.finished:
+                        logger.info(f"Generation completed for request {request_id}")
+                        #finished = True
+                        break
+
+            except Exception as e:
+                logger.error(f"Error in adaptive quality talker listener for request {request_id}: {e}")
+                finished = True
+
+            finally:
+                # 清理工作
+                self._cleanup_talker_listener(request_id, output_queue, include_code2wav)
+
+        # 启动监听线程
+        self.talker_listener[request_id] = Thread(target=_listen, daemon=True)
+        self.talker_listener[request_id].start()
+
+    def _handle_ultra_low_latency_phase(
+        self, output, state, config_manager, talker_client,
+        request_id, talker_input_queue, current_time, 
+        last_text_check_time, buffer_status
+    ) -> bool:
+        """
+        处理极低延迟阶段（0-2秒音频）
+        策略：立即处理每个文本token，快速生成少量音频token
+        """
+
+        config = config_manager.get_config(AudioGenerationPhase.ULTRA_LOW_LATENCY)
+        target_tokens = config['audio_token_target_per_text']
+        max_wait = config['max_wait_time']
+
+        # 策略1：立即检查新文本token（非阻塞）
+        if not output.finished:
+            new_tokens = self._collect_immediate_text_tokens(talker_input_queue, max_count=1)
+
+            if new_tokens:
+                # 立即发送，使用快速参数
+                finished = self._send_tokens_with_fast_params(
+                    talker_client, request_id, new_tokens
+                )
+                if finished:
+                    return True
+
+                state.text_tokens_processed += len(new_tokens)
+                logger.debug(f"Ultra-low-latency: processed {len(new_tokens)} text tokens for {request_id}")
+
+        # 策略2：音频token数量控制 - 达到目标就继续，不等待更多
+        current_audio_tokens = self._count_current_audio_tokens(output)
+
+        # 策略3：紧急模式处理
+        if buffer_status == "EMERGENCY":
+            # 强制输出已有音频，不等待更多生成
+            logger.warning(f"Emergency mode activated for request {request_id}")
+            state.emergency_mode = True
+
+        return False
+
+    def _handle_balanced_phase(
+        self, output, state, config_manager, talker_client,
+        request_id, talker_input_queue, current_time,
+        last_text_check_time, buffer_status, text_token_buffer
+    ) -> bool:
+        """
+        处理平衡阶段（2-5秒音频）
+        策略：小批量处理，平衡质量和延迟
+        """
+
+        config = config_manager.get_config(AudioGenerationPhase.BALANCED)
+        batch_size = config['text_token_batch_size']
+        max_wait = config['max_wait_time']
+
+        # 策略1：按时间或buffer状态决定收集频率
+        should_collect = (
+            current_time - last_text_check_time >= max_wait or
+            buffer_status == "EMERGENCY" or
+            len(text_token_buffer) == 0
+        )
+
+        if should_collect and not output.finished:
+            # 收集文本token批次
+            if buffer_status == "EMERGENCY":
+                # 紧急模式：立即处理任何可用token
+                new_tokens = self._collect_immediate_text_tokens(talker_input_queue, max_count=1)
+            else:
+                # 正常模式：等待小批次
+                new_tokens = self._collect_text_tokens_with_timeout(
+                    talker_input_queue, batch_size, max_wait
+                )
+
+            if new_tokens:
+                finished = self._send_tokens_with_balanced_params(
+                    talker_client, request_id, new_tokens
+                )
+                if finished:
+                    return True
+
+                state.text_tokens_processed += len(new_tokens)
+                logger.debug(f"Balanced: processed {len(new_tokens)} text tokens for {request_id}")
+
+        return False
+
+    def _handle_high_quality_phase(
+        self, output, state, config_manager, talker_client,
+        request_id, talker_input_queue, current_time,
+        last_text_check_time, buffer_status, text_token_buffer
+    ) -> bool:
+        """
+        处理高质量阶段（5秒后音频）
+        策略：较大批量处理，优先考虑质量
+        """
+
+        config = config_manager.get_config(AudioGenerationPhase.HIGH_QUALITY)
+        batch_size = config['text_token_batch_size']
+        max_wait = config['max_wait_time']
+
+        # 策略1：更宽松的收集策略，除非buffer紧急
+        should_collect = (
+            current_time - last_text_check_time >= max_wait or
+            buffer_status == "EMERGENCY" or
+            len(text_token_buffer) >= batch_size
+        )
+
+        if should_collect and not output.finished:
+            if buffer_status == "EMERGENCY":
+                # 即使在高质量阶段，紧急时也要快速处理
+                new_tokens = self._collect_immediate_text_tokens(talker_input_queue, max_count=2)
+            else:
+                # 正常收集较大批次
+                new_tokens = self._collect_text_tokens_with_timeout(
+                    talker_input_queue, batch_size, max_wait
+                )
+
+            if new_tokens:
+                finished = self._send_tokens_with_quality_params(
+                    talker_client, request_id, new_tokens
+                )
+                if finished:
+                    return True
+
+                state.text_tokens_processed += len(new_tokens)
+                logger.debug(f"High-quality: processed {len(new_tokens)} text tokens for {request_id}")
+
+        return False
+
+    def _collect_immediate_text_tokens(
+        self, talker_input_queue:queue.Queue, max_count: int = 1
+    ) -> List[Tuple[torch.Tensor, bool]]:
+        """立即收集可用的文本token（非阻塞）"""
+        tokens = []
+
+        for _ in range(max_count):
+            try:
+                prompt_embeds, finished = talker_input_queue.get_nowait()
+                tokens.append((prompt_embeds, finished))
+
+                if finished:
+                    break
+            except queue.Empty:
+                break
+
+        return tokens
+
+    def _collect_text_tokens_with_timeout(
+        self, talker_input_queue:queue.Queue, target_count: int, timeout: float
+    ) -> List[Tuple[torch.Tensor, bool]]:
+        """在超时时间内收集指定数量的文本token"""
+        tokens = []
+        start_time = time.time()
+
+        while len(tokens) < target_count and (time.time() - start_time) < timeout:
+            try:
+                # 使用较短的超时避免长时间阻塞
+                prompt_embeds, finished = talker_input_queue.get(timeout=0.05)
+                tokens.append((prompt_embeds, finished))
+
+                if finished:
+                    break
+            except queue.Empty:
+                # 如果已有部分token，可以提前返回
+                if tokens:
+                    break
+                continue
+
+        return tokens
+
+    def _send_tokens_with_fast_params(
+        self, talker_client, request_id: str, tokens: List[Tuple[torch.Tensor, bool]]
+    ) -> bool:
+        """使用快速参数发送token"""
+        return self._send_tokens_sequential(talker_client, request_id, tokens, delay=0.01)
+
+    def _send_tokens_with_balanced_params(
+        self, talker_client, request_id: str, tokens: List[Tuple[torch.Tensor, bool]]
+    ) -> bool:
+        """使用平衡参数发送token"""
+        return self._send_tokens_sequential(talker_client, request_id, tokens, delay=0.02)
+
+    def _send_tokens_with_quality_params(
+        self, talker_client, request_id: str, tokens: List[Tuple[torch.Tensor, bool]]
+    ) -> bool:
+        """使用质量参数发送token"""
+        return self._send_tokens_sequential(talker_client, request_id, tokens, delay=0.03)
+
+    def _send_tokens_sequential(
+        self, talker_client, request_id: str, 
+        tokens: List[Tuple[torch.Tensor, bool]], delay: float = 0.02
+    ) -> bool:
+        """顺序发送token到talker"""
+        final_finished = False
+
+        for i, (prompt_embeds, finished) in enumerate(tokens):
+            if prompt_embeds is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        talker_client.resume_request(
+                            request_id, 
+                            prompt_embeds=prompt_embeds, 
+                            forever=finished
+                        ),
+                        self._loop,
+                    ).result(timeout=5.0)
+
+                    # 适应性延迟
+                    if i < len(tokens) - 1:
+                        time.sleep(delay)
+
+                except Exception as e:
+                    logger.error(f"Failed to send token {i+1}/{len(tokens)} for {request_id}: {e}")
+                    continue
+
+            if finished:
+                final_finished = True
+                break
+
+        return final_finished
+
+    def _count_current_audio_tokens(self, output) -> int:
+        """计算当前输出的音频token数量"""
+        if hasattr(output, 'outputs') and output.outputs:
+            return len(output.outputs[0].token_ids)
+        return 0
+
+    def _handle_code2wav_output(self, output, last_output, voice_type):
+        """处理code2wav相关的输出"""
+        if last_output is None:
+            if output.finished:
+                self._talker_to_code2wav(output.request_id, voice_type, [], True)
+        else:
+            talker_hf_config = self.talker_config
+            if hasattr(talker_hf_config, 'talker_config'):
+                talker_hf_config = talker_hf_config.talker_config
+
+            last_code = list(last_output.outputs[0].token_ids) if last_output.outputs else []
+
+            if output.finished:
+                curr_code = list(output.outputs[0].token_ids) if output.outputs else []
+                if curr_code and curr_code[-1] in [
+                        talker_hf_config.tts_codec_end_token_id,
+                        talker_hf_config.tts_codec_start_token_id
+                ]:
+                    self._talker_to_code2wav(output.request_id, voice_type, last_code, False)
+                    self._talker_to_code2wav(output.request_id, voice_type, curr_code[:-1], True)
+                else:
+                    self._talker_to_code2wav(output.request_id, voice_type, last_code, False)
+                    self._talker_to_code2wav(output.request_id, voice_type, curr_code, True)
+            else:
+                self._talker_to_code2wav(output.request_id, voice_type, last_code, False)
+
+    def _cleanup_talker_listener(self, request_id: str, output_queue, include_code2wav: bool):
+        """清理talker监听器资源"""
+
+        # 发送结束信号
+        if not self._code2wav_engine_clients or not include_code2wav:
+            with contextlib.suppress(Exception):
+                output_queue.put(None)
+
+        # 清理引用
+        with contextlib.suppress(Exception):
+            if request_id in self.talker_listener:
+                del self.talker_listener[request_id]
+
+        with contextlib.suppress(Exception):
+            if request_id in self.talker_inputs:
+                del self.talker_inputs[request_id]
+
+        logger.info(f"Cleaned up adaptive quality talker listener for request {request_id}")
+
+    def _listen_talker(
+        self,
+        talker_client,
+        request_id: str,
+        voice_type: str,
+        generator,
+        output_queue,
+        talker_input_queue,
+    ):
+        """重写原始方法，使用自适应质量版本"""
+        return self._listen_talker_adaptive_quality(
+            talker_client,
+            request_id,
+            voice_type,
+            generator,
+            output_queue,
+            talker_input_queue,
+        )
